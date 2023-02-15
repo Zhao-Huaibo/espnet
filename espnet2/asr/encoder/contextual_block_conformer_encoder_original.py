@@ -7,7 +7,6 @@ Created on Sat Aug 21 17:27:16 2021.
 
 import math
 from typing import Optional, Tuple
-import logging
 
 import torch
 from typeguard import check_argument_types
@@ -188,36 +187,15 @@ class ContextualBlockConformerEncoder(AbsEncoder):
                 concat_after,
             ),
         )
-        self.encoders_aux = repeat(
-            num_blocks // 2,
-            lambda lnum: ContextualBlockEncoderLayer(
-                output_size,
-                MultiHeadedAttention(
-                    attention_heads, output_size, attention_dropout_rate
-                ),
-                positionwise_layer(*positionwise_layer_args),
-                positionwise_layer(*positionwise_layer_args) if macaron_style else None,
-                convolution_layer(*convolution_layer_args) if use_cnn_module else None,
-                dropout_rate,
-                num_blocks,
-                normalize_before,
-                concat_after,
-            ),
-        )
-
         if self.normalize_before:
             self.after_norm = LayerNorm(output_size)
-            self.after_norm2 = LayerNorm(output_size)
 
         # for block processing
         self.block_size = block_size
-        self.block_size2 = block_size
         self.hop_size = hop_size
         self.look_ahead = look_ahead
         self.init_average = init_average
         self.ctx_pos_enc = ctx_pos_enc
-        self.hop_size2 = hop_size + look_ahead
-        self.look_ahead2 = 0
 
     def output_size(self) -> int:
         return self._output_size
@@ -262,7 +240,6 @@ class ContextualBlockConformerEncoder(AbsEncoder):
         Returns:
             position embedded tensor and mask
         """
-        # lookahead_long = lookahead[0]
         masks = (~make_pad_mask(ilens)[:, None, :]).to(xs_pad.device)
 
         if isinstance(self.embed, Conv2dSubsamplingWOPosEnc):
@@ -273,7 +250,6 @@ class ContextualBlockConformerEncoder(AbsEncoder):
         # create empty output container
         total_frame_num = xs_pad.size(1)
         ys_pad = xs_pad.new_zeros(xs_pad.size())
-        ys_pad2 = xs_pad.new_zeros(xs_pad.size())
 
         past_size = self.block_size - self.hop_size - self.look_ahead
 
@@ -287,34 +263,24 @@ class ContextualBlockConformerEncoder(AbsEncoder):
                 xs_pad = self.after_norm(xs_pad)
 
             olens = masks.squeeze(1).sum(1)
-            return xs_pad, olens, xs_pad
+            return xs_pad, olens, None
 
         # start block processing
         cur_hop = 0
-        cur_hop2 = 0
         block_num = math.ceil(
             float(total_frame_num - past_size - self.look_ahead) / float(self.hop_size)
-        )
-        block_num2 = math.ceil(
-            float(total_frame_num - past_size - self.look_ahead2) / float(self.hop_size2)
         )
         bsize = xs_pad.size(0)
         addin = xs_pad.new_zeros(
             bsize, block_num, xs_pad.size(-1)
         )  # additional context embedding vecctors
-        addin2 = xs_pad.new_zeros(
-            bsize, block_num2, xs_pad.size(-1)
-        )  # additional context embedding vecctors
 
         # first step
         if self.init_average:  # initialize with average value
             addin[:, 0, :] = xs_pad.narrow(1, cur_hop, self.block_size).mean(1)
-            addin2[:, 0, :] = xs_pad.narrow(1, cur_hop2, self.block_size2).mean(1)
         else:  # initialize with max value
             addin[:, 0, :] = xs_pad.narrow(1, cur_hop, self.block_size).max(1)
-            addin2[:, 0, :] = xs_pad.narrow(1, cur_hop2, self.block_size2).max(1)
         cur_hop += self.hop_size
-        cur_hop2 += self.hop_size2
         # following steps
         while cur_hop + self.block_size < total_frame_num:
             if self.init_average:  # initialize with average value
@@ -326,16 +292,6 @@ class ContextualBlockConformerEncoder(AbsEncoder):
                     1, cur_hop, self.block_size
                 ).max(1)
             cur_hop += self.hop_size
-        while cur_hop2 + self.block_size2 < total_frame_num:
-            if self.init_average:  # initialize with average value
-                addin2[:, cur_hop2 // self.hop_size2, :] = xs_pad.narrow(
-                    1, cur_hop2, self.block_size2
-                ).mean(1)
-            else:  # initialize with max value
-                addin[:, cur_hop2 // self.hop_size2, :] = xs_pad.narrow(
-                    1, cur_hop2, self.block_size2
-                ).max(1)
-            cur_hop2 += self.hop_size2
         # last step
         if cur_hop < total_frame_num and cur_hop // self.hop_size < block_num:
             if self.init_average:  # initialize with average value
@@ -346,66 +302,33 @@ class ContextualBlockConformerEncoder(AbsEncoder):
                 addin[:, cur_hop // self.hop_size, :] = xs_pad.narrow(
                     1, cur_hop, total_frame_num - cur_hop
                 ).max(1)
-        if cur_hop2 < total_frame_num and cur_hop2 // self.hop_size2 < block_num2:
-            if self.init_average:  # initialize with average value
-                addin2[:, cur_hop2 // self.hop_size2, :] = xs_pad.narrow(
-                    1, cur_hop2, total_frame_num - cur_hop2
-                ).mean(1)
-            else:  # initialize with max value
-                addin2[:, cur_hop2 // self.hop_size2, :] = xs_pad.narrow(
-                    1, cur_hop2, total_frame_num - cur_hop2
-                ).max(1)
 
         if self.ctx_pos_enc:
             addin = self.pos_enc(addin)
-            addin2 = self.pos_enc(addin2)
 
         xs_pad = self.pos_enc(xs_pad)
-
 
         # set up masks
         mask_online = xs_pad.new_zeros(
             xs_pad.size(0), block_num, self.block_size + 2, self.block_size + 2
         )
-        mask_online2 = xs_pad.new_zeros(
-            xs_pad.size(0), block_num2, self.block_size2 + 2, self.block_size2 + 2
-        )
-        # if lookahead_long:
         mask_online.narrow(2, 1, self.block_size + 1).narrow(
             3, 0, self.block_size + 1
         ).fill_(1)
-        mask_online2.narrow(2, 1, self.block_size2 + 1).narrow(
-            3, 0, self.block_size2 + 1
-        ).fill_(1)
-        # else:
-        #     mask_online.narrow(2, 1, self.block_size + 1).narrow(
-        #         3, 0, self.block_size + 1 - self.look_ahead
-        #     ).fill_(1)
-
 
         xs_chunk = xs_pad.new_zeros(
             bsize, block_num, self.block_size + 2, xs_pad.size(-1)
-        )
-        xs_chunk2 = xs_pad.new_zeros(
-            bsize, block_num2, self.block_size2 + 2, xs_pad.size(-1)
         )
 
         # fill the input
         # first step
         left_idx = 0
         block_idx = 0
-        left_idx2 = 0
-        block_idx2 = 0
         xs_chunk[:, block_idx, 1 : self.block_size + 1] = xs_pad.narrow(
             -2, left_idx, self.block_size
         )
-        xs_chunk2[:, block_idx2, 1 : self.block_size2 + 1] = xs_pad.narrow(
-            -2, left_idx2, self.block_size2
-        )
         left_idx += self.hop_size
-        left_idx2 += self.hop_size2
         block_idx += 1
-        block_idx2 += 1
         # following steps
         while left_idx + self.block_size < total_frame_num and block_idx < block_num:
             xs_chunk[:, block_idx, 1 : self.block_size + 1] = xs_pad.narrow(
@@ -413,20 +336,10 @@ class ContextualBlockConformerEncoder(AbsEncoder):
             )
             left_idx += self.hop_size
             block_idx += 1
-        while left_idx2 + self.block_size2 < total_frame_num and block_idx2 < block_num2:
-            xs_chunk2[:, block_idx2, 1 : self.block_size2 + 1] = xs_pad.narrow(
-                -2, left_idx2, self.block_size2
-            )
-            left_idx2 += self.hop_size2
-            block_idx2 += 1
         # last steps
         last_size = total_frame_num - left_idx
         xs_chunk[:, block_idx, 1 : last_size + 1] = xs_pad.narrow(
             -2, left_idx, last_size
-        )
-        last_size2 = total_frame_num - left_idx2
-        xs_chunk2[:, block_idx2, 1 : last_size2 + 1] = xs_pad.narrow(
-            -2, left_idx2, last_size2
         )
 
         # fill the initial context vector
@@ -434,24 +347,9 @@ class ContextualBlockConformerEncoder(AbsEncoder):
         xs_chunk[:, 1:, 0] = addin[:, 0 : block_num - 1]
         xs_chunk[:, :, self.block_size + 1] = addin
 
-        xs_chunk2[:, 0, 0] = addin2[:, 0]
-        xs_chunk2[:, 1:, 0] = addin2[:, 0 : block_num2 - 1]
-        xs_chunk2[:, :, self.block_size2 + 1] = addin2
-
         # forward
         ys_chunk, mask_online, _, _, _, _, _ = self.encoders(
             xs_chunk, mask_online, False, xs_chunk
-        )
-        # ys_chunk, mask_online, _, _, _, _, _ = self.encoders2(
-        #     ys_chunk, mask_online, False, ys_chunk
-        # )
-        for layer_idx, encoder_layer in enumerate(self.encoders):
-            if layer_idx <= 2:
-                xs_chunk2, mask_online2, _, _, _, _, _  = encoder_layer(xs_chunk2, mask_online2, False, xs_chunk2)
-            else:
-                break
-        ys_chunk2, mask_online2, _, _, _, _, _ = self.encoders_aux(
-            xs_chunk2, mask_online2, False, xs_chunk2
         )
 
         # copy output
@@ -463,14 +361,6 @@ class ContextualBlockConformerEncoder(AbsEncoder):
         ys_pad[:, left_idx:cur_hop] = ys_chunk[:, block_idx, 1 : cur_hop + 1]
         left_idx += self.hop_size
         block_idx += 1
-
-        offset2 = self.block_size2 - self.look_ahead2 - self.hop_size2 + 1
-        left_idx2 = 0
-        block_idx2 = 0
-        cur_hop2 = self.block_size2 - self.look_ahead2
-        ys_pad2[:, left_idx2:cur_hop2] = ys_chunk2[:, block_idx2, 1 : cur_hop2 + 1]
-        left_idx2 += self.hop_size2
-        block_idx2 += 1
         # following steps
         while left_idx + self.block_size < total_frame_num and block_idx < block_num:
             ys_pad[:, cur_hop : cur_hop + self.hop_size] = ys_chunk[
@@ -483,25 +373,11 @@ class ContextualBlockConformerEncoder(AbsEncoder):
             :, block_idx, offset : last_size + 1, :
         ]
 
-        while left_idx2 + self.block_size2 < total_frame_num and block_idx2 < block_num2:
-            ys_pad2[:, cur_hop2 : cur_hop2 + self.hop_size2] = ys_chunk2[
-                :, block_idx2, offset2 : offset2 + self.hop_size2
-            ]
-            cur_hop2 += self.hop_size2
-            left_idx2 += self.hop_size2
-            block_idx2 += 1
-        ys_pad2[:, cur_hop2:total_frame_num] = ys_chunk2[
-            :, block_idx2, offset2 : last_size2 + 1, :
-        ]
-
         if self.normalize_before:
             ys_pad = self.after_norm(ys_pad)
-            ys_pad2 = self.after_norm2(ys_pad2)
 
         olens = masks.squeeze(1).sum(1)
-        return ys_pad, olens, ys_pad2
-
-    
+        return ys_pad, olens, None
 
     def forward_infer(
         self,
@@ -519,7 +395,6 @@ class ContextualBlockConformerEncoder(AbsEncoder):
         Returns:
             position embedded tensor and mask
         """
-        #logging.info("Enter encoding")
         if prev_states is None:
             prev_addin = None
             buffer_before_downsampling = None
@@ -555,7 +430,7 @@ class ContextualBlockConformerEncoder(AbsEncoder):
                     "past_encoder_ctx": past_encoder_ctx,
                 }
                 return (
-                    (xs_pad.new_zeros(bsize, 0, self._output_size), xs_pad.new_zeros(bsize, 0, self._output_size)),
+                    xs_pad.new_zeros(bsize, 0, self._output_size),
                     xs_pad.new_zeros(bsize),
                     next_states,
                 )
@@ -572,16 +447,11 @@ class ContextualBlockConformerEncoder(AbsEncoder):
             ilens = ilens.new_full(
                 [1], dtype=torch.long, fill_value=n_samples * self.subsample
             )
-            #logging.info("continued with xs_pad")
-            #logging.info(xs_pad.shape)
 
         if isinstance(self.embed, Conv2dSubsamplingWOPosEnc):
             xs_pad, _ = self.embed(xs_pad, None)
         elif self.embed is not None:
             xs_pad = self.embed(xs_pad)
-
-        #logging.info("subsampled, xs_pad: ")
-        #logging.info(xs_pad.shape)
 
         # create empty output container
         if buffer_after_downsampling is not None:
@@ -607,7 +477,7 @@ class ContextualBlockConformerEncoder(AbsEncoder):
                     "past_encoder_ctx": past_encoder_ctx,
                 }
                 return (
-                    (xs_pad.new_zeros(bsize, 0, self._output_size), xs_pad.new_zeros(bsize, 0, self._output_size)),
+                    xs_pad.new_zeros(bsize, 0, self._output_size),
                     xs_pad.new_zeros(bsize),
                     next_states,
                 )
@@ -620,12 +490,6 @@ class ContextualBlockConformerEncoder(AbsEncoder):
             )
             xs_pad = xs_pad.narrow(1, 0, block_num * self.hop_size + overlap_size)
 
-
-
-        mask = torch.zeros([xs_pad.size(0), self.look_ahead, xs_pad.size(2)]).to(xs_pad.device)
-        xs_pad_r = torch.cat([xs_pad, mask], dim=1)
-        xs_pad_r = xs_pad_r.narrow(1, self.look_ahead, xs_pad.size(1))
-        
         # block_size could be 0 meaning infinite
         # apply usual encoder for short sequence
         assert self.block_size > 0
@@ -637,53 +501,35 @@ class ContextualBlockConformerEncoder(AbsEncoder):
             xs_pad = xs_pad.squeeze(0)
             if self.normalize_before:
                 xs_pad = self.after_norm(xs_pad)
-
-            return (xs_pad, xs_pad), None, None
+            return xs_pad, None, None
 
         # start block processing
         xs_chunk = xs_pad.new_zeros(
             bsize, block_num, self.block_size + 2, xs_pad.size(-1)
-        )
-        xs_chunk_r = xs_pad_r.new_zeros(
-            bsize, block_num, self.block_size + 2, xs_pad_r.size(-1)
         )
 
         for i in range(block_num):
             cur_hop = i * self.hop_size
             chunk_length = min(self.block_size, total_frame_num - cur_hop)
             addin = xs_pad.narrow(1, cur_hop, chunk_length)
-            prev_addin_r = xs_pad.narrow(1, cur_hop, cur_hop+self.look_ahead)
             if self.init_average:
                 addin = addin.mean(1, keepdim=True)
-                prev_addin_r = prev_addin_r.mean(1, keepdim=True)
             else:
                 addin = addin.max(1, keepdim=True)
-                prev_addin_r = prev_addin_r.max(1, keepdim=True)
-
             if self.ctx_pos_enc:
                 addin = self.pos_enc(addin, i + n_processed_blocks)
 
             if prev_addin is None:
                 prev_addin = addin
-
             xs_chunk[:, i, 0] = prev_addin
             xs_chunk[:, i, -1] = addin
-
-            xs_chunk_r[:, i, 0] = prev_addin_r
-            xs_chunk_r[:, i, -1] = addin
 
             chunk = self.pos_enc(
                 xs_pad.narrow(1, cur_hop, chunk_length),
                 cur_hop + self.hop_size * n_processed_blocks,
             )
 
-            chunk_r = self.pos_enc(
-                xs_pad_r.narrow(1, cur_hop, chunk_length),
-                cur_hop + self.hop_size * n_processed_blocks + self.look_ahead,
-            )
-
             xs_chunk[:, i, 1 : chunk_length + 1] = chunk
-            xs_chunk_r[:, i, 1 : chunk_length + 1] = chunk_r
 
             prev_addin = addin
 
@@ -691,13 +537,7 @@ class ContextualBlockConformerEncoder(AbsEncoder):
         mask_online = xs_pad.new_zeros(
             xs_pad.size(0), block_num, self.block_size + 2, self.block_size + 2
         )
-        mask_online2 = xs_pad.new_zeros(
-            xs_pad.size(0), block_num, self.block_size + 2, self.block_size + 2
-        )
         mask_online.narrow(2, 1, self.block_size + 1).narrow(
-            3, 0, self.block_size + 1
-        ).fill_(1)
-        mask_online2.narrow(2, 1, self.block_size + 1).narrow(
             3, 0, self.block_size + 1
         ).fill_(1)
 
@@ -705,67 +545,35 @@ class ContextualBlockConformerEncoder(AbsEncoder):
             xs_chunk, mask_online, True, past_encoder_ctx
         )
 
-        for layer_idx, encoder_layer in enumerate(self.encoders):
-            if layer_idx <= 2:
-                xs_chunk_r, mask_online2, _, _, _, _, _  = encoder_layer(xs_chunk_r, mask_online2, True, past_encoder_ctx)
-            else:
-                break
-        ys_chunk_r, _, _, _, past_encoder_ctx_r, _, _ = self.encoders_aux(
-            xs_chunk_r, mask_online2, True, past_encoder_ctx
-        )
-        #logging.info("we encode")
-        #logging.info(xs_chunk.shape)
-
         # remove addin
         ys_chunk = ys_chunk.narrow(2, 1, self.block_size)
-        ys_chunk_r = ys_chunk_r.narrow(2, 1, self.block_size)
 
         offset = self.block_size - self.look_ahead - self.hop_size
         if is_final:
             if n_processed_blocks == 0:
                 y_length = xs_pad.size(1)
-                y_r_length = xs_pad_r.size(1)
             else:
                 y_length = xs_pad.size(1) - offset
-                y_r_length = xs_pad_r.size(1) - offset
         else:
             y_length = block_num * self.hop_size
-            y_r_length = block_num * self.look_ahead
             if n_processed_blocks == 0:
                 y_length += offset
-                y_r_length += offset
-
-
         ys_pad = xs_pad.new_zeros((xs_pad.size(0), y_length, xs_pad.size(2)))
-        ys_pad_r = xs_pad_r.new_zeros((xs_pad_r.size(0), y_r_length, xs_pad_r.size(2)))
         if n_processed_blocks == 0:
             ys_pad[:, 0:offset] = ys_chunk[:, 0, 0:offset]
-            ys_pad_r[:, 0 : offset] = ys_chunk_r[:, 0, 0 : offset]
         for i in range(block_num):
             cur_hop = i * self.hop_size
             if n_processed_blocks == 0:
                 cur_hop += offset
             if i == block_num - 1 and is_final:
                 chunk_length = min(self.block_size - offset, ys_pad.size(1) - cur_hop)
-                la = max(0, chunk_length - self.hop_size)
             else:
                 chunk_length = self.hop_size
-                la = self.look_ahead
-
             ys_pad[:, cur_hop : cur_hop + chunk_length] = ys_chunk[
                 :, i, offset : offset + chunk_length
             ]
-
-            if la > 0 and y_r_length > 0:
-                ys_pad_r[:, cur_hop : cur_hop + la] = ys_chunk_r[
-                    :, i, offset : offset + la
-                ]
-            elif y_r_length == 0:
-                ys_pad_r = ys_pad
-
         if self.normalize_before:
             ys_pad = self.after_norm(ys_pad)
-            ys_pad_r = self.after_norm2(ys_pad_r)
 
         if is_final:
             next_states = None
@@ -779,4 +587,4 @@ class ContextualBlockConformerEncoder(AbsEncoder):
                 "past_encoder_ctx": past_encoder_ctx,
             }
 
-        return (ys_pad, ys_pad_r), None, next_states
+        return ys_pad, None, next_states
